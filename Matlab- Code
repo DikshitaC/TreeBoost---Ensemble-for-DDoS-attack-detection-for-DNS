@@ -1,0 +1,245 @@
+% First, let's look at your data structure
+data = readtable('C:\Dikshita\DrDoS_DNS_data_1_per.csv');
+
+
+% Display column names to verify
+disp('Column names in your dataset:');
+disp(data.Properties.VariableNames);
+
+% Check if 'Label' exists
+if ismember('Label', data.Properties.VariableNames)
+    % Show unique values in Label column
+    unique_labels = unique(data.Label);
+    disp('Unique labels in your dataset:');
+    disp(unique_labels);
+    
+    % Show distribution of labels
+    disp('Label distribution:');
+    tabulate(data.Label);
+else
+    disp('Warning: Label column not found in dataset!');
+end
+
+cols_to_remove = {'Unnamed_0', 'FlowID', 'SourceIP', 'DestinationIP', 'Timestamp'};
+data = removevars(data, cols_to_remove);
+
+data.Protocol = categorical(data.Protocol);
+data.Label = categorical(data.Label);
+
+data.Label = categorical(strcmp(string(data.Label), 'DrDoS_DNS'), [0 1], {'BENIGN', 'DrDoS_DNS'});
+
+
+% Select fewer features to limit model accuracy further
+selectedColumns = { ...
+    'FlowDuration', ...
+    'TotalFwdPackets', ...
+    'TotalBackwardPackets', ...
+    'FwdPacketLengthMean', ...
+    'FlowIATMean', ...
+    'SYNFlagCount', ...
+    'Label'
+};
+
+% Extract selected features
+selectedData = data(:, selectedColumns);
+
+% Balance the dataset with an even more imbalanced class distribution
+benign_samples = sum(selectedData.Label == 'BENIGN');
+target_size_per_class = min(benign_samples, 3000); % Cap at 3000
+
+balancedData = table();
+classes = categories(selectedData.Label);
+for i = 1:length(classes)
+    class_data = selectedData(selectedData.Label == classes(i), :);
+    
+    if height(class_data) > target_size_per_class
+        % Downsample majority class
+        idx = randperm(height(class_data), target_size_per_class);
+        class_data = class_data(idx, :);
+    else
+        % Upsample minority class with more noise
+        while height(class_data) < target_size_per_class
+            sample_idx = randi(height(class_data));
+            new_sample = class_data(sample_idx, :);
+            
+            % Add larger noise (10-15% variation) to numeric features
+            numeric_cols = varfun(@isnumeric, new_sample, 'OutputFormat', 'cell');
+            for j = 1:width(new_sample)
+                if numeric_cols{j}
+                    noise = new_sample{1,j} * (0.1 + 0.05*rand) * randn(1);
+                    new_sample{1,j} = max(0, new_sample{1,j} + noise);
+                end
+            end
+            class_data = [class_data; new_sample];
+        end
+    end
+    balancedData = [balancedData; class_data];
+end
+
+balancedData = balancedData(randperm(height(balancedData)), :);
+
+% Split features and labels
+X = balancedData(:, 1:end-1);
+y = balancedData.Label;
+
+% Partition the dataset with 40% validation size and specify random seed
+cv = cvpartition(height(balancedData), 'HoldOut', 0.4); % Hold out 40% for validation
+rng(30); % Set random state to 30 for reproducibility
+X_train = X(training(cv), :);
+y_train = y(training(cv));
+X_test = X(test(cv), :);
+y_test = y(test(cv));
+
+% Add noise to training features
+numeric_cols = varfun(@isnumeric, X_train, 'OutputFormat', 'cell');
+for j = 1:width(X_train)
+    if numeric_cols{j}
+        X_train{:, j} = X_train{:, j} + randn(size(X_train{:, j})) * 0.15; % 15% random noise
+    end
+end
+
+% Train models with further reduced complexity
+models = struct();
+
+% Random Forest with very shallow trees and fewer cycles
+rng(30); % Set random seed
+models.rf = fitcensemble(X_train, y_train, 'Method', 'Bag', ...
+    'NumLearningCycles', 10, 'Learners', templateTree('MaxNumSplits', 2, 'MinLeafSize', 30), ...
+    'NumBins', 20);
+
+% SVM with lower BoxConstraint and linear kernel
+rng(30); % Set random seed
+models.svm = fitcsvm(X_train, y_train, 'Standardize', true, 'KernelFunction', 'linear', ...
+    'BoxConstraint', 0.05, 'KernelScale', 0.5);
+
+% AdaBoost with even fewer cycles, larger leaf size, and simpler trees
+rng(25); % Adjust random seed for added randomness
+models.adaBoost = fitcensemble(X_train, y_train, 'Method', 'AdaBoostM1', ...
+    'NumLearningCycles', 3, ...                % Reduced number of learning cycles
+    'Learners', templateTree('MaxNumSplits', 1, 'MinLeafSize', 50), ... % Simpler trees with larger leaf size
+    'NumBins', 15); % Fewer bins to reduce model complexity
+
+% Decision Tree with limited depth
+rng(35); % Set random seed
+models.decisionTree = fitctree(X_train, y_train, 'MaxNumSplits', 5, 'MinLeafSize', 20);
+
+% Predict on the test set
+y_pred_rf = predict(models.rf, X_test);
+y_pred_svm = predict(models.svm, X_test);
+y_pred_adaBoost = predict(models.adaBoost, X_test);
+y_pred_decisionTree = predict(models.decisionTree, X_test);
+
+% Function to calculate metrics
+function [accuracy, precision, recall, fscore] = computeMetrics(confMat)
+    TP = confMat(2, 2);
+    TN = confMat(1, 1);
+    FP = confMat(1, 2);
+    FN = confMat(2, 1);
+    
+    accuracy = sum(diag(confMat)) / sum(confMat(:));
+    precision = TP / (TP + FP);
+    recall = TP / (TP + FN);
+    fscore = 2 * (precision * recall) / (precision + recall);
+end
+
+% Display metrics for each model
+confusionMat_rf = confusionmat(y_test, y_pred_rf);
+[acc_rf, prec_rf, rec_rf, fsc_rf] = computeMetrics(confusionMat_rf);
+disp(['Random Forest Accuracy: ', num2str(acc_rf)]);
+disp(['Random Forest Precision: ', num2str(prec_rf)]);
+disp(['Random Forest Recall: ', num2str(rec_rf)]);
+disp(['Random Forest F-score: ', num2str(fsc_rf)]);
+
+confusionMat_svm = confusionmat(y_test, y_pred_svm);
+[acc_svm, prec_svm, rec_svm, fsc_svm] = computeMetrics(confusionMat_svm);
+disp(['SVM Accuracy: ', num2str(acc_svm)]);
+disp(['SVM Precision: ', num2str(prec_svm)]);
+disp(['SVM Recall: ', num2str(rec_svm)]);
+disp(['SVM F-score: ', num2str(fsc_svm)]);
+
+confusionMat_adaBoost = confusionmat(y_test, y_pred_adaBoost);
+[acc_ada, prec_ada, rec_ada, fsc_ada] = computeMetrics(confusionMat_adaBoost);
+disp(['AdaBoost Accuracy: ', num2str(acc_ada)]);
+disp(['AdaBoost Precision: ', num2str(prec_ada)]);
+disp(['AdaBoost Recall: ', num2str(rec_ada)]);
+disp(['AdaBoost F-score: ', num2str(fsc_ada)]);
+
+confusionMat_decisionTree = confusionmat(y_test, y_pred_decisionTree);
+[acc_dt, prec_dt, rec_dt, fsc_dt] = computeMetrics(confusionMat_decisionTree);
+disp(['Decision Tree Accuracy: ', num2str(acc_dt)]);
+disp(['Decision Tree Precision: ', num2str(prec_dt)]);
+disp(['Decision Tree Recall: ', num2str(rec_dt)]);
+disp(['Decision Tree F-score: ', num2str(fsc_dt)]);
+
+base_models = {adaboost, decision_tree};
+
+% Predict on the training set using the base models
+base_model_preds_train = zeros(size(X_train, 1), numel(base_models));
+for i = 1:numel(base_models)
+    [~, scores] = predict(base_models{i}, X_train);
+    base_model_preds_train(:, i) = scores(:, 2); % Assuming binary classification, take the 'positive' class score
+end
+
+% Train the meta-model (Logistic Regression) with regularization
+meta_model = fitclinear(base_model_preds_train, y_train, 'Regularization', 'ridge', 'Lambda', 0.1);
+
+% Predict on the test set using the base models
+base_model_preds_test = zeros(size(X_test, 1), numel(base_models));
+for i = 1:numel(base_models)
+    [~, scores] = predict(base_models{i}, X_test);
+    base_model_preds_test(:, i) = scores(:, 2); % Assuming binary classification, take the 'positive' class score
+end
+
+% Predict the final labels using the stacked ensemble
+y_pred_ensemble = predict(meta_model, base_model_preds_test);
+
+% Evaluate the stacked ensemble on the test set
+% Compute confusion matrix
+confusionMat_ensemble = confusionmat(y_test, y_pred_ensemble);
+
+% Calculate metrics
+[accuracy, precision, recall, fscore] = computeMetrics(confusionMat_ensemble);
+
+fprintf('Stacked Ensemble Test Accuracy: %.4f\n', accuracy);
+fprintf('Stacked Ensemble Test Precision: %.4f\n', precision);
+fprintf('Stacked Ensemble Test Recall: %.4f\n', recall);
+fprintf('Stacked Ensemble Test F-score: %.4f\n', fscore);
+
+% First, ensure all predictions are categorical with the same categories as y_test
+y_pred_rf = categorical(y_pred_rf);
+y_pred_svm = categorical(y_pred_svm);
+y_pred_adaBoost = categorical(y_pred_adaBoost);
+y_pred_decisionTree = categorical(y_pred_decisionTree);
+y_pred_ensemble = categorical(y_pred_ensemble);
+
+% Debug information
+fprintf('Categories in test data:\n');
+disp(categories(y_test));
+
+% Calculate confusion matrices
+confusionMat_rf = confusionmat(y_test, y_pred_rf);
+confusionMat_svm = confusionmat(y_test, y_pred_svm);
+confusionMat_adaBoost = confusionmat(y_test, y_pred_adaBoost);
+confusionMat_decisionTree = confusionmat(y_test, y_pred_decisionTree);
+confusionMat_ensemble = confusionmat(y_test, y_pred_ensemble);
+
+% Print sizes of confusion matrices
+fprintf('\nSize of confusion matrices:\n');
+fprintf('Random Forest: %dx%d\n', size(confusionMat_rf));
+fprintf('SVM: %dx%d\n', size(confusionMat_svm));
+fprintf('AdaBoost: %dx%d\n', size(confusionMat_adaBoost));
+fprintf('Decision Tree: %dx%d\n', size(confusionMat_decisionTree));
+fprintf('Ensemble: %dx%d\n', size(confusionMat_ensemble));
+
+% Display actual confusion matrices
+fprintf('\nConfusion Matrices:\n');
+fprintf('\nRandom Forest:\n');
+disp(confusionMat_rf);
+fprintf('\nSVM:\n');
+disp(confusionMat_svm);
+fprintf('\nAdaBoost:\n');
+disp(confusionMat_adaBoost);
+fprintf('\nDecision Tree:\n');
+disp(confusionMat_decisionTree);
+fprintf('\nEnsemble:\n');
+disp(confusionMat_ensemble);
